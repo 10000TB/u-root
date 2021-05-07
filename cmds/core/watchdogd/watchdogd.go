@@ -7,8 +7,6 @@
 // Synopsis:
 //     watchdogd run [OPTIONS]
 //         Run the watchdogd in a child process (does not daemonize).
-//     watchdogd pid
-//         Print the pid of the running watchdogd
 //     watchdogd stop
 //         Send a signal to arm the running watchdog.
 //     watchdogd continue
@@ -42,8 +40,6 @@ import (
 func usage() {
 	fmt.Print(`watchdogd run [--dev DEV] [--timeout N] [--pre_timeout N] [--keep_alive N] [--monitors STRING]
 	Run the watchdogd daemon in a child process (does not daemonize).
-watchdogd pid
-	Print the pid of the running watchdogd.
 watchdogd stop
 	Send a signal to arm the running watchdogd.
 watchdogd continue
@@ -103,12 +99,11 @@ func runCommand() error {
 		if len(args) != 0 {
 			usage()
 		}
-		d, err := watchdogd.Find()
+		d, err := watchdogd.NewClient()
 		if err != nil {
-			return fmt.Errorf("could not find watchdog daemon: %v", err)
+			return fmt.Errorf("could not dial watchdog daemon: %v", err)
 		}
 		f, ok := map[string]func() error{
-			"pid":      func() error { fmt.Println(d.Pid); return nil },
 			"stop":     d.Stop,
 			"continue": d.Continue,
 			"arm":      d.Arm,

@@ -7,7 +7,7 @@
 //
 // It starts in the running+armed state:
 //
-//             \| watchdogd Running     | watchdogd Stopped
+//              | watchdogd Running     | watchdogd Stopped
 //     ---------+-----------------------+--------------------------
 //     Watchdog | watchdogd is actively | machine will soon reboot
 //     Armed    | keeping machine alive |
@@ -15,23 +15,16 @@
 //     Watchdog | a hang will not       | a hang will not reboot
 //     Disarmed | reboot the machine    | the machine
 //
-// The following signals control changing state:
-//
-//     - STOP: running -> stopped
-//     - CONT: stopped -> running
-//     - USR1: armed -> disarmed
-//     - USR2: disarmed -> armed
+
 package watchdogd
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"io/ioutil"
 	"log"
+	"net"
 	"os"
-	"os/signal"
-	"path/filepath"
-	"strconv"
 	"strings"
 	"time"
 
@@ -39,8 +32,38 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// DaemonProcess is the name of the daemon process.
-const DaemonProcess = "watchdogd"
+// UDS is the name of daemon's unix domain socket.
+const UDS = "/tmp/watchdogd"
+
+const (
+	OpStop     = iota // 0 - Stop the watchdogd petting.
+	OpContinue        // 1 - Continue the watchdogd petting.
+	OpDisarm          // 2 - Disarm the watchdog.
+	OpArm             // 3 - Arm the watchdog.
+)
+
+const (
+	OpResultOK    = iota // 0 - OK
+	OpResultERROR        // 1 - ERROR
+)
+
+const (
+	opStopPettingTimeoutSeconds = 10
+)
+
+// currentOpts is current operating parameters for the daemon.
+//
+// It is assigned at the first call of Run and updated on each subsequent call of it.
+var currentOpts *DaemonOpts
+
+// currentWd is an open file descriptor to the watchdog device specified in the daemon options.
+var currentWd *watchdog.Watchdog
+
+// pettingOp syncs the signal to continue or stop petting the watchdog.
+var pettingOp chan int = make(chan int)
+
+// pettingOn indicate if there is an active petting session.
+var pettingOn bool = false
 
 // DaemonOpts contain options for the watchdog daemon.
 type DaemonOpts struct {
@@ -71,153 +94,251 @@ func MonitorOops() error {
 	return nil
 }
 
-// Run runs the watchdog on the current goroutine. The USR1, USR2, STOP and
-// CONT signals are used to control, so consider using a dedicated process.
-// Consider using the watchdogd command in u-root. Cancelling the context will
-// leave with the armed/disarmed state as is.
-func Run(ctx context.Context, opts *DaemonOpts) error {
-	defer log.Println("watchdogd: Daemon quit")
-
-	signals := make(chan os.Signal, 5)
-	signal.Notify(signals, unix.SIGUSR1, unix.SIGUSR2)
-	defer signal.Stop(signals)
-
-	for {
-		wd, err := watchdog.Open(opts.Dev)
+// startServing enters a loop of accepting and processing next incoming watchdogd operation call.
+func startServing(l *net.UnixListener) {
+	for { // All requests are processed sequentially.
+		c, err := l.AcceptUnix()
 		if err != nil {
-			// Most likely cause is /dev/watchdog does not exist.
-			// Second most likely cause is another process (perhaps
-			// another watchdogd?) has the file open.
-			return fmt.Errorf("watchdog: Failed to arm: %v", err)
+			log.Printf("watchdogd: %v", err)
+			continue
 		}
-		if opts.Timeout != nil {
-			if err := wd.SetTimeout(*opts.Timeout); err != nil {
-				wd.Close()
-				return fmt.Errorf("watchdog: Failed to set timeout: %v", err)
-			}
+		b := make([]byte, 1) // Expect single byte operation instruction.
+		nr, err := c.Read(b[:])
+		if err != nil || nr != 1 {
+			log.Printf("watchdogd: Failed to read oeration bit, err: %v, read: %d", err, nr)
 		}
-		if opts.PreTimeout != nil {
-			if err := wd.SetPreTimeout(*opts.PreTimeout); err != nil {
-				wd.Close()
-				return fmt.Errorf("watchdog: Failed to set pretimeout: %v", err)
-			}
+		op := int(b[0])
+		r := OpResultERROR
+		switch op {
+		case OpStop:
+			r = stopPetting()
+		case OpContinue:
+			r = startPetting()
+		case OpArm:
+			r = armWatchdog()
+		case OpDisarm:
+			r = disarmWatchdog()
 		}
-		log.Println("watchdog: Armed")
+		c.Write([]byte{byte(r)})
+		c.Close()
+	}
+}
 
-	armed: // Loop while armed. SIGUSR1 to break.
-		for {
-			select {
-			case <-time.After(opts.KeepAlive):
-				doMonitors(opts.Monitors)
-				if err := wd.KeepAlive(); err != nil {
-					log.Printf("watchdog: Failed to keepalive: %v", err)
-					// Keep trying to pet until the watchdog times out.
-				}
-			case s := <-signals:
-				if s == unix.SIGUSR1 {
-					break armed
-				}
-			case <-ctx.Done():
-				return wd.Close()
-			}
-		}
-		if err := wd.MagicClose(); err != nil {
-			log.Printf("watchdog: Failed to disarm: %v", err)
-		} else {
-			log.Println("watchdog: Disarmed")
-		}
+// setupListener sets up a new "unix" network listener for the daemon.
+func setupListener() (*net.UnixListener, func(), error) {
+	os.Remove(UDS)
 
-	disarmed: // Loop while disarmed. SIGUSR2 to break.
-		for {
-			select {
-			case s := <-signals:
-				if s == unix.SIGUSR2 {
-					break disarmed
-				}
-			case <-ctx.Done():
-				return nil
-			}
+	l, err := net.ListenUnix("unix", &net.UnixAddr{UDS, "unix"})
+	if err != nil {
+		return nil, nil, fmt.Errorf("watchdogd: %v", err)
+	}
+	cleanup := func() {
+		os.Remove(UDS)
+	}
+	return l, cleanup, nil
+}
+
+// armWatchdog starts watchdog timer.
+func armWatchdog() int {
+	if currentOpts == nil {
+		log.Printf("Current daemon opts is nil, don't know how to arm Watchdog")
+		return OpResultERROR
+	}
+	wd, err := watchdog.Open(currentOpts.Dev)
+	if err != nil {
+		// Most likely cause is /dev/watchdog does not exist.
+		// Second most likely cause is another process (perhaps
+		// another watchdogd?) has the file open.
+		log.Printf("Failed to arm: %v", err)
+		return OpResultERROR
+	}
+	if currentOpts.Timeout != nil {
+		if err := wd.SetTimeout(*currentOpts.Timeout); err != nil {
+			currentWd.Close()
+			log.Printf("Failed to set timeout: %v", err)
+			return OpResultERROR
 		}
 	}
+	if currentOpts.PreTimeout != nil {
+		if err := wd.SetPreTimeout(*currentOpts.PreTimeout); err != nil {
+			currentWd.Close()
+			log.Printf("Failed to set pretimeout: %v", err)
+			return OpResultERROR
+		}
+	}
+	currentWd = wd
+	log.Printf("watchdogd: Watchdog armed")
+	return OpResultOK
+}
+
+// disarmWatchdog disarm the watchdog if already armed.
+func disarmWatchdog() int {
+	if currentWd == nil {
+		log.Printf("watchdogd: No armed Watchdog")
+		return OpResultOK
+	}
+	if err := currentWd.MagicClose(); err != nil {
+		log.Printf("watchdogd: Failed to disarm watchdog: %v", err)
+		return OpResultERROR
+	}
+	return OpResultOK
+}
+
+// doPetting sends keepalive signal to Watchdog when necessary.
+//
+// If at least one of the custom monitors failed check(s), it won't send a keepalive
+// signal.
+func doPetting() error {
+	if currentWd == nil {
+		return fmt.Errorf("no reference to any Watchdog")
+	}
+	if err := doMonitors(currentOpts.Monitors); err != nil {
+		return fmt.Errorf("won't keepalive since at least one of the custom monitors failed: %v", err)
+	}
+	if err := currentWd.KeepAlive(); err != nil {
+		return err
+	}
+	return nil
+}
+
+// startPetting starts Watchdog petting in a new goroutine.
+func startPetting() int {
+	if pettingOn {
+		log.Printf("watchdogd: Petting ongoing")
+		return OpResultERROR
+	}
+
+	go func() {
+		pettingOn = true
+		defer func() { pettingOn = false }()
+		for {
+			select {
+			case op := <-pettingOp:
+				if op == OpStop {
+					return
+				}
+			case <-time.After(currentOpts.KeepAlive):
+				if err := doPetting(); err != nil {
+					log.Printf("watchdogd: Failed to keeplive: %v", err)
+					// Keep trying to pet until the watchdog times out.
+				}
+			}
+		}
+	}()
+	return OpResultOK
+}
+
+// stopPetting stops an ongoing petting process if there is.
+func stopPetting() int {
+	if !pettingOn {
+		return OpResultOK
+	} // No petting on, simply return.
+	r := OpResultOK
+	erredOut := func() {
+		<-pettingOp
+		log.Printf("Stop petting times out after %d seconds", opStopPettingTimeoutSeconds)
+		r = OpResultERROR
+	}
+	// It will time out when there is no active petting.
+	t := time.AfterFunc(opStopPettingTimeoutSeconds*time.Second, erredOut)
+	defer t.Stop()
+	pettingOp <- OpStop
+	return r
+}
+
+// Run starts up the daemon.
+//
+// That includes:
+// 1) Starts listening for watchdog(d) operation requests over unix network.
+// 2) Arm the watchdog timer if it is not already armed.
+// 3) Starts petting the watchdog timer.
+func Run(ctx context.Context, opts *DaemonOpts) error {
+	defer log.Printf("watchdogd: Daemon quit")
+	currentOpts = opts
+
+	l, cleanup, err := setupListener()
+	if err != nil {
+		return fmt.Errorf("watchdogd: Failed to setup server: %v", err)
+	}
+	go func() {
+		startServing(l)
+	}()
+
+	if r := armWatchdog(); r != OpResultOK {
+		return fmt.Errorf("watchdogd: Initial arm failed")
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			cleanup()
+		}
+	}
+
 }
 
 // doMonitors is a helper function to run the monitors.
-func doMonitors(monitors []func() error) {
+//
+// If there is anything wrong identified, it serves as a signal to stop
+// petting Watchdog.
+func doMonitors(monitors []func() error) error {
 	for _, m := range monitors {
 		if err := m(); err != nil {
-			log.Printf("watchdog: Stopping keepalive due to: %v", err)
-			// Stop the current process.
-			p, err := os.FindProcess(os.Getpid())
-			if err != nil {
-				// We can't stop the process, so take it down.
-				log.Fatalf("watchdog: Error stopping: %v", err)
-			}
-			if err := (*Daemon)(p).Stop(); err != nil {
-				// We can't stop the process, so take it down.
-				log.Fatalf("watchdog: Error stopping: %v", err)
-			}
-
-			// Someone intentionally sent a SIGCONT (probably via a
-			// `watchdogd continue`). They probably have some
-			// unfinished business with the machine, so continue
-			// petting.
-			break
+			return err
 		}
 	}
+	// All monitors return normal.
+	return nil
 }
 
-// Daemon represents a daemon running in a separate process.
-type Daemon os.Process
+type client struct {
+	Conn *net.UnixConn
+}
 
-// Find returns the process id of the daemon called watchdogd.
-func Find() (*Daemon, error) {
-	files, err := filepath.Glob("/proc/*/comm")
+func (c *client) Stop() error {
+	return sendAndCheckResult(c.Conn, OpStop)
+}
+
+func (c *client) Continue() error {
+	return sendAndCheckResult(c.Conn, OpContinue)
+}
+
+func (c *client) Disarm() error {
+	return sendAndCheckResult(c.Conn, OpDisarm)
+}
+
+func (c *client) Arm() error {
+	return sendAndCheckResult(c.Conn, OpArm)
+}
+
+// sendAndCheckResult sends operation bit and evaluates result.
+func sendAndCheckResult(c *net.UnixConn, op int) error {
+	n, err := c.Write([]byte{byte(op)})
+	if err != nil {
+		return err
+	}
+	if n != 1 {
+		return errors.New("no error; but message not delivered neither")
+	}
+	buf := make([]byte, 1)
+	n, err = c.Read(buf[:])
+	if err != nil {
+		return fmt.Errorf("error reading from server: %v", err)
+	}
+	if n != 1 {
+		return fmt.Errorf("received message from server, but incorrect length")
+	}
+	r := int(buf[0])
+	if r != OpResultOK {
+		return fmt.Errorf("non-zero op result code: %d", r)
+	}
+	return nil
+}
+
+func NewClient() (*client, error) {
+	conn, err := net.DialUnix("unix", nil, &net.UnixAddr{UDS, "unix"})
 	if err != nil {
 		return nil, err
 	}
-	for _, f := range files {
-		// Ignore errors since /proc changes frequently.
-		comm, _ := ioutil.ReadFile(f)
-		// Skip matches where the wildcard is not an integer.
-		pidStr := filepath.Base(filepath.Dir(f))
-		pid, err := strconv.Atoi(pidStr)
-		if err != nil {
-			continue
-		}
-		// Skip matches for the current process.
-		if pid == os.Getpid() {
-			continue
-		}
-		// Skip kernel workers. This is the same mechanism used by ps.
-		cmdline, err := ioutil.ReadFile(filepath.Join(filepath.Dir(f), "cmdline"))
-		if err != nil || len(cmdline) == 0 {
-			continue
-		}
-		// /proc files have a gratuitous newline.
-		if string(comm) == DaemonProcess+"\n" {
-			p, err := os.FindProcess(pid)
-			return (*Daemon)(p), err
-		}
-	}
-	return nil, fmt.Errorf("could not find %q", DaemonProcess)
-}
-
-// Stop stops the daemon. It can be resumed with Continue().
-func (d *Daemon) Stop() error {
-	return (*os.Process)(d).Signal(unix.SIGSTOP)
-}
-
-// Continue continues the daemon from a previous Stop().
-func (d *Daemon) Continue() error {
-	return (*os.Process)(d).Signal(unix.SIGCONT)
-}
-
-// Disarm sends a signal to the watchdog daemon to disarm.
-func (d *Daemon) Disarm() error {
-	return (*os.Process)(d).Signal(unix.SIGUSR1)
-}
-
-// Arm sends a signal to the watchdog deamon to arm.
-func (d *Daemon) Arm() error {
-	return (*os.Process)(d).Signal(unix.SIGUSR2)
+	return &client{Conn: conn}, nil
 }
