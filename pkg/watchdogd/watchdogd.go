@@ -292,23 +292,23 @@ func doMonitors(monitors []func() error) error {
 }
 
 type client struct {
-	Conn *net.UnixConn
+	conn *net.UnixConn
 }
 
 func (c *client) Stop() error {
-	return sendAndCheckResult(c.Conn, OpStop)
+	return sendAndCheckResult(c.conn, OpStop)
 }
 
 func (c *client) Continue() error {
-	return sendAndCheckResult(c.Conn, OpContinue)
+	return sendAndCheckResult(c.conn, OpContinue)
 }
 
 func (c *client) Disarm() error {
-	return sendAndCheckResult(c.Conn, OpDisarm)
+	return sendAndCheckResult(c.conn, OpDisarm)
 }
 
 func (c *client) Arm() error {
-	return sendAndCheckResult(c.Conn, OpArm)
+	return sendAndCheckResult(c.conn, OpArm)
 }
 
 // sendAndCheckResult sends operation bit and evaluates result.
@@ -340,5 +340,5 @@ func NewClient() (*client, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &client{Conn: conn}, nil
+	return &client{conn: conn}, nil
 }
